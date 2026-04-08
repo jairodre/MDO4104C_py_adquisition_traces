@@ -1,6 +1,6 @@
 # MDO4104C_py_adquisition_traces
 
-Code for adquiring reading from oscilloscope MDO4104C via Ethernet connection.
+Code for adquiring traces from oscilloscope MDO4104C via Ethernet connection.
 
 Things for setting up configurations on oscilloscope:
 
