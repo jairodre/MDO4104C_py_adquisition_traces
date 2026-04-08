@@ -15,17 +15,17 @@ Number of waveforms to save: `N_WF = 20`
 Number of points (sampling) in your trace: `RECORD_LENGTH = 10_000`
 
 Triger channel source and level: 
-`
+```
 TRIG_SOURCE = "CH2"
 TRIG_LEVEL_V = 0.1         # Trigger level in volts
 TRIG_SLOPE = "RISE"        # RISE or FALL
 TRIG_COUPLING = "DC"       # DC/AC/HFREJ/LFREJ/NOISEREJ (depends on scope)
-`
+```
 
 Traces saved from selected channel (for example you are doing trigger in CH2 but your signal is in CH4): `SAVE_SOURCE = "CH4"`
 
 Set bandwidth: 
-`
+```
 SET_BANDWIDTH = True
 BANDWIDTH_OPTION = "FULL"
-`
+```
