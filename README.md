@@ -14,7 +14,7 @@ Number of waveforms to save: `N_WF = 20`
 
 Number of points (sampling) in your trace: `RECORD_LENGTH = 10_000`
 
-Triger channel source and level: 
+Trigger channel source and level: 
 ```
 TRIG_SOURCE = "CH2"
 TRIG_LEVEL_V = 0.1         # Trigger level in volts
