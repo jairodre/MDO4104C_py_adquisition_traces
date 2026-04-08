@@ -4,19 +4,19 @@ Code for adquiring traces from oscilloscope MDO4104C via Ethernet connection.
 
 Things for setting up configurations on oscilloscope:
 
-Modify this for your oscilloscope IP address: `DIRECT_RESOURCE = "TCPIP0::169.254.X.XXX::INSTR"`
+Change to your oscilloscope IP address: `DIRECT_RESOURCE = "TCPIP0::169.254.X.XXX::INSTR"`
 
-Model of the device used: `MODEL_MATCH = "MDO4104C"`
+Model of the device used (needed for detect the osiclloscope via pyvisa): `MODEL_MATCH = "MDO4104C"`
 
 Output folder to save your traces: `OUTDIR = Path("folderpulses")`
 
-Number of waveforms to save: `N_WF = 20`
+Number of waveforms to save: `N_WF = 2000`
 
 Number of points (sampling) in your trace: `RECORD_LENGTH = 10_000`
 
 Trigger channel source and level: 
 ```
-TRIG_SOURCE = "CH2"
+TRIG_SOURCE = "CH2"        # Channel used as trigger
 TRIG_LEVEL_V = 0.1         # Trigger level in volts
 TRIG_SLOPE = "RISE"        # RISE or FALL
 TRIG_COUPLING = "DC"       # DC/AC/HFREJ/LFREJ/NOISEREJ (depends on scope)
