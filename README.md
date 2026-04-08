@@ -1,6 +1,6 @@
 # MDO4104C_py_adquisition_traces
 
-Code for adquiring traces from oscilloscope MDO4104C via Ethernet connection.
+Code for adquiring traces from oscilloscope MDO4104C via Ethernet connection. A lot of room for improve. Many part were written by ChatGPT.
 
 Things for setting up configurations on oscilloscope:
 
