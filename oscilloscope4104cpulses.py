@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import time
 import threading
+import re
 from pathlib import Path
 from queue import Queue
 from typing import Dict, Tuple, List, Union, Optional
@@ -17,20 +18,44 @@ DIRECT_RESOURCE = "TCPIP0::169.254.2.219::INSTR"
 
 MODEL_MATCH = "MDO4104C"
 
-OUTDIR = Path("folderpulses")
+OUTDIR = Path("singleSiPM_pulsedLED_DCDCbias")
 
-N_WF = 20
-RECORD_LENGTH = 10_000
+N_WF = 1000
+RECORD_LENGTH = 100_000
 
-TRIG_SOURCE = "CH4"
-TRIG_LEVEL_V = 0.1
+# TRIGGERED: wait for TRIG_SOURCE/TRIG_LEVEL_V before each saved waveform.
+# AUTO_UNTRIGGERED_ROLL: acquire without requiring an external trigger.
+#   On MDO4000-series scopes, true roll display requires trigger AUTO mode and
+#   a slow HORIZONTAL_SCALE_S, typically 40 ms/div or slower.
+ACQUISITION_MODE = "AUTO_UNTRIGGERED_ROLL"  # TRIGGERED or AUTO_UNTRIGGERED_ROLL
+
+# Scope display/acquisition geometry. Values are per division unless noted.
+# Use None to leave a setting unchanged on the scope.
+
+# HORIZONTAL_SCALE_S accepted
+# 400ps
+# 1, 2, 4, 10, 20, 40, 100, 200, 400 ns, us, ms, s
+# 1ks
+
+HORIZONTAL_SCALE_S = "100us"       # seconds/div; accepts strings like "10us", "100ms"
+HORIZONTAL_DELAY_S = None       # seconds; accepts strings like "0s", "50us"
+HORIZONTAL_POSITION_PCT = None  # percent, e.g. 50.0
+
+SAVE_VERTICAL_SCALE_V = "15mV"    # volts/div; accepts strings like "5mV", "100mV"
+SAVE_VERTICAL_OFFSET_V = None   # volts; accepts strings like "0V", "25mV"
+SAVE_VERTICAL_POSITION_DIV = None  # divisions, e.g. 0.0
+
+TRIG_SOURCE = "CH1"
+TRIG_LEVEL_V = 0.850
 TRIG_SLOPE = "RISE"        # RISE or FALL
 TRIG_COUPLING = "DC"       # DC/AC/HFREJ/LFREJ/NOISEREJ (depends on scope)
 
 SAVE_SOURCE = "CH4"
 SET_BANDWIDTH = True
-BANDWIDTH_OPTION = "FULL"
-# BANDWIDTH_OPTION = "20MHz"
+BANDWIDTH_OPTION = "20MHz"
+# BANDWIDTH_OPTION = "100MHz"  # experimental; scope may reject or coerce this
+# BANDWIDTH_OPTION = "250MHz"
+# BANDWIDTH_OPTION = "FULL"  # same as 1GHz on MDO4104C
 # ==================== RELIABILITY / PERFORMANCE TUNING ====================
 # How many times to retry a single waveform index before aborting the run.
 MAX_RETRIES_PER_WF = 8
@@ -46,6 +71,11 @@ POLL_S = 0.02
 
 # Timeout waiting for trigger/acquisition completion (seconds)
 ACQ_TIMEOUT_S = 30.0
+
+# In AUTO_UNTRIGGERED_ROLL mode the scope may keep running instead of stopping
+# by itself. The script waits at least this long, then explicitly stops and reads.
+AUTO_CAPTURE_MIN_S = 0.20
+AUTO_CAPTURE_SETTLE_RECORDS = 1.2
 
 # If the direct VISA resource disappears (VI_ERROR_RSRC_NFOUND), try rediscovering the scope.
 REDISCOVER_ON_RSRC_NFOUND = True
@@ -94,6 +124,148 @@ ASYNC_CSV_WRITER = True
 CSV_QUEUE_MAX_ITEMS = 16
 
 # ================================================================
+
+SettingValue = Union[str, float, int]
+
+TIME_UNITS = {
+    "ps": 1e-12,
+    "ns": 1e-9,
+    "us": 1e-6,
+    "µs": 1e-6,
+    "μs": 1e-6,
+    "ms": 1e-3,
+    "s": 1.0,
+    "sec": 1.0,
+}
+
+VOLT_UNITS = {
+    "uv": 1e-6,
+    "µv": 1e-6,
+    "μv": 1e-6,
+    "mv": 1e-3,
+    "v": 1.0,
+}
+
+FREQ_UNITS = {
+    "hz": 1.0,
+    "khz": 1e3,
+    "mhz": 1e6,
+    "ghz": 1e9,
+}
+
+HORIZONTAL_SCALE_MIN_S = 400e-12
+HORIZONTAL_SCALE_MAX_S = 1000.0
+VERTICAL_SCALE_MIN_V = 1e-3
+VERTICAL_SCALE_MAX_V = 10.0
+TIME_SCALE_MANTISSAS = (1.0, 2.0, 4.0, 10.0, 20.0, 40.0, 100.0, 200.0, 400.0)
+
+
+def parse_quantity(value: SettingValue, units: Dict[str, float], default_unit: str, setting_name: str) -> float:
+    if isinstance(value, (int, float)):
+        return float(value)
+    if not isinstance(value, str):
+        raise TypeError(f"{setting_name} must be None, a number, or a string with units.")
+
+    text = value.strip().lower().replace(" ", "")
+    match = re.fullmatch(r"([+-]?(?:\d+(?:\.\d*)?|\.\d+)(?:e[+-]?\d+)?)([a-zµμ]*)", text)
+    if not match:
+        raise ValueError(f"Could not parse {setting_name}={value!r}. Example values: '10us', '100ms', '5mV'.")
+
+    number = float(match.group(1))
+    unit = match.group(2) or default_unit
+    if unit not in units:
+        allowed = ", ".join(sorted(units))
+        raise ValueError(f"Unknown unit '{unit}' for {setting_name}. Allowed units: {allowed}.")
+    return number * units[unit]
+
+
+def build_horizontal_scale_values() -> List[float]:
+    values = [400e-12]
+    for unit_scale in (1e-9, 1e-6, 1e-3, 1.0):
+        values.extend(mantissa * unit_scale for mantissa in TIME_SCALE_MANTISSAS)
+    values.append(1000.0)
+    return sorted(set(values))
+
+
+HORIZONTAL_SCALE_VALUES_S = build_horizontal_scale_values()
+
+
+def nearest_allowed_scale(value: float, allowed_values: List[float], setting_name: str) -> float:
+    if value <= 0:
+        raise ValueError(f"{setting_name} must be positive.")
+    if value < allowed_values[0] or value > allowed_values[-1]:
+        raise ValueError(
+            f"{setting_name}={value:g} is outside allowed range {allowed_values[0]:g} to {allowed_values[-1]:g}."
+        )
+    return min(allowed_values, key=lambda candidate: abs(np.log(value / candidate)))
+
+
+def parse_time(value: SettingValue, setting_name: str) -> float:
+    return parse_quantity(value, TIME_UNITS, "s", setting_name)
+
+
+def parse_voltage(value: SettingValue, setting_name: str) -> float:
+    return parse_quantity(value, VOLT_UNITS, "v", setting_name)
+
+
+def parse_frequency(value: SettingValue, setting_name: str) -> float:
+    return parse_quantity(value, FREQ_UNITS, "hz", setting_name)
+
+
+def parse_percent(value: SettingValue, setting_name: str) -> float:
+    if isinstance(value, str):
+        value = value.strip()
+        if value.endswith("%"):
+            value = value[:-1]
+    return float(value)
+
+
+def selected_horizontal_scale_s() -> Optional[float]:
+    if HORIZONTAL_SCALE_S is None:
+        return None
+    requested = parse_time(HORIZONTAL_SCALE_S, "HORIZONTAL_SCALE_S")
+    selected = nearest_allowed_scale(requested, HORIZONTAL_SCALE_VALUES_S, "HORIZONTAL_SCALE_S")
+    if not np.isclose(requested, selected, rtol=1e-12, atol=0.0):
+        print(f"Warning: HORIZONTAL_SCALE_S={requested:g} s/div is not a scope scale; using {selected:g} s/div.")
+    return selected
+
+
+def selected_vertical_scale_v() -> Optional[float]:
+    if SAVE_VERTICAL_SCALE_V is None:
+        return None
+    requested = parse_voltage(SAVE_VERTICAL_SCALE_V, "SAVE_VERTICAL_SCALE_V")
+    if requested <= 0:
+        raise ValueError("SAVE_VERTICAL_SCALE_V must be positive.")
+    if requested < VERTICAL_SCALE_MIN_V or requested > VERTICAL_SCALE_MAX_V:
+        raise ValueError(
+            f"SAVE_VERTICAL_SCALE_V={requested:g} is outside allowed range "
+            f"{VERTICAL_SCALE_MIN_V:g} to {VERTICAL_SCALE_MAX_V:g} V/div."
+        )
+    return requested
+
+
+def normalized_acquisition_mode() -> str:
+    mode = ACQUISITION_MODE.strip().upper()
+    aliases = {
+        "TRIG": "TRIGGERED",
+        "TRIGGER": "TRIGGERED",
+        "ROLL": "AUTO_UNTRIGGERED_ROLL",
+        "RLL": "AUTO_UNTRIGGERED_ROLL",
+        "UNTRIGGERED": "AUTO_UNTRIGGERED_ROLL",
+        "AUTO": "AUTO_UNTRIGGERED_ROLL",
+        "AUTO_ROLL": "AUTO_UNTRIGGERED_ROLL",
+    }
+    mode = aliases.get(mode, mode)
+    if mode not in ("TRIGGERED", "AUTO_UNTRIGGERED_ROLL"):
+        raise ValueError(
+            "ACQUISITION_MODE must be 'TRIGGERED' or 'AUTO_UNTRIGGERED_ROLL'."
+        )
+    return mode
+
+
+def using_triggered_acquisition() -> bool:
+    return normalized_acquisition_mode() == "TRIGGERED"
+
 
 def rm_open() -> pyvisa.ResourceManager:
     return pyvisa.ResourceManager()
@@ -258,6 +430,8 @@ def set_channel_bandwidth(inst, ch: str, option: str) -> None:
     opt = option.strip().upper()
     mapping: Dict[str, Union[str, float]] = {
         "FULL": "FULL",
+        "1GHZ": "FULL",
+        "1000MHZ": "FULL",
         "20MHZ": 20e6,
         "250MHZ": 250e6,
     }
@@ -265,16 +439,19 @@ def set_channel_bandwidth(inst, ch: str, option: str) -> None:
     if opt in mapping:
         target = mapping[opt]
     else:
-        try:
-            target = float(opt)
-        except ValueError as e:
-            raise ValueError(
-                f"Unknown bandwidth option '{option}'. Use FULL, 20MHz, 250MHz, or numeric Hz like '2e7'."
-            ) from e
+        target = parse_frequency(option, "BANDWIDTH_OPTION")
+        if target <= 0:
+            raise ValueError("BANDWIDTH_OPTION must be positive.")
+        print(
+            f"Warning: requesting experimental bandwidth {target:g} Hz. "
+            "MDO4104C may reject it or coerce it to FULL/1GHz, 250MHz, or 20MHz."
+        )
 
     if target == "FULL":
+        print(f"{ch} bandwidth request: FULL")
         inst.write(f"{ch}:BANDWIDTH FULL")
     else:
+        print(f"{ch} bandwidth request: {float(target):g} Hz")
         inst.write(f"{ch}:BANDWIDTH {float(target)}")
 
     rb = safe_query(inst, f"{ch}:BANDWIDTH?", default="")
@@ -282,25 +459,76 @@ def set_channel_bandwidth(inst, ch: str, option: str) -> None:
         print(f"{ch} bandwidth readback: {rb}")
 
 
+def apply_horizontal_settings(inst) -> None:
+    horizontal_scale_s = selected_horizontal_scale_s()
+    if horizontal_scale_s is not None:
+        inst.write(f"HORizontal:MAIn:SCAle {horizontal_scale_s}")
+    if HORIZONTAL_DELAY_S is not None:
+        inst.write(f"HORizontal:DELay:TIMe {parse_time(HORIZONTAL_DELAY_S, 'HORIZONTAL_DELAY_S')}")
+    if HORIZONTAL_POSITION_PCT is not None:
+        inst.write(f"HORizontal:POSition {parse_percent(HORIZONTAL_POSITION_PCT, 'HORIZONTAL_POSITION_PCT')}")
+
+
+def apply_vertical_settings(inst, ch: str) -> None:
+    vertical_scale_v = selected_vertical_scale_v()
+    if vertical_scale_v is not None:
+        inst.write(f"{ch}:SCAle {vertical_scale_v}")
+    if SAVE_VERTICAL_OFFSET_V is not None:
+        inst.write(f"{ch}:OFFSet {parse_voltage(SAVE_VERTICAL_OFFSET_V, 'SAVE_VERTICAL_OFFSET_V')}")
+    if SAVE_VERTICAL_POSITION_DIV is not None:
+        inst.write(f"{ch}:POSition {float(SAVE_VERTICAL_POSITION_DIV)}")
+
+
+def set_and_verify_trigger_mode(inst, mode: str) -> None:
+    target = mode.strip().upper()
+    if target not in ("AUTO", "NORMAL"):
+        raise ValueError("Trigger mode must be AUTO or NORMAL.")
+
+    inst.write(f"TRIGger:A:MODe {target}")
+    readback = safe_query(inst, "TRIGger:A:MODe?", default="").strip().upper()
+    if target == "NORMAL":
+        accepted = readback.startswith("NORM")
+    else:
+        accepted = readback.startswith("AUTO")
+
+    if not accepted:
+        err = safe_query(inst, "ALLev?", default="").strip()
+        detail = f" Scope error: {err}" if err else ""
+        raise RuntimeError(
+            f"Scope did not accept trigger mode {target}; readback was '{readback}'.{detail}"
+        )
+
+
 def setup_scope(inst):
+    acq_mode = normalized_acquisition_mode()
     inst.write("ACQuire:STATE STOP")
     try:
         inst.write("HORizontal:MODe MANual")
     except Exception:
         pass
+    apply_horizontal_settings(inst)
+    apply_vertical_settings(inst, SAVE_SOURCE)
     inst.write(f"HORizontal:RECOrdlength {RECORD_LENGTH}")
     rec_readback = qi(inst, "HORizontal:RECOrdlength?", RECORD_LENGTH)
     if rec_readback != RECORD_LENGTH:
         print(f"Warning: requested RECORD_LENGTH={RECORD_LENGTH}, scope applied {rec_readback}.")
 
-    inst.write("TRIGger:A:TYPe EDGe")
-    inst.write(f"TRIGger:A:EDGE:SOUrce {TRIG_SOURCE}")
-    inst.write(f"TRIGger:A:EDGE:SLOPe {TRIG_SLOPE}")
-    inst.write(f"TRIGger:A:EDGE:COUPling {TRIG_COUPLING}")
-    inst.write(f"TRIGger:A:LEVel:{TRIG_SOURCE} {TRIG_LEVEL_V}")
+    if acq_mode == "TRIGGERED":
+        inst.write("TRIGger:A:TYPe EDGe")
+        inst.write(f"TRIGger:A:EDGE:SOUrce {TRIG_SOURCE}")
+        inst.write(f"TRIGger:A:EDGE:SLOPe {TRIG_SLOPE}")
+        inst.write(f"TRIGger:A:EDGE:COUPling {TRIG_COUPLING}")
+        inst.write(f"TRIGger:A:LEVel:{TRIG_SOURCE} {TRIG_LEVEL_V}")
 
-    inst.write("ACQuire:STOPAfter SEQuence")
+    if acq_mode == "TRIGGERED":
+        inst.write("ACQuire:STOPAfter SEQuence")
+    else:
+        inst.write("ACQuire:STOPAfter RUNSTop")
     inst.write("ACQuire:MODe SAMple")
+    if acq_mode == "TRIGGERED":
+        set_and_verify_trigger_mode(inst, "NORMAL")
+    else:
+        set_and_verify_trigger_mode(inst, "AUTO")
 
 
 def arm_and_wait(inst, poll_s: float = 0.01, timeout_s: float = 30.0):
@@ -313,6 +541,52 @@ def arm_and_wait(inst, poll_s: float = 0.01, timeout_s: float = 30.0):
         if time.time() - t0 > timeout_s:
             raise TimeoutError("Timed out waiting for trigger/acquisition completion.")
         time.sleep(poll_s)
+
+
+def run_auto_capture_window(
+    inst,
+    const: Dict[str, Union[float, int, bool, str]],
+    poll_s: float = 0.01,
+    timeout_s: float = 30.0,
+) -> None:
+    record_s = float(const["XINCR"]) * int(const["NR_PT"])
+    wait_s = max(AUTO_CAPTURE_MIN_S, record_s * AUTO_CAPTURE_SETTLE_RECORDS)
+    inst.write("ACQuire:STATE RUN")
+    time.sleep(wait_s)
+    inst.write("ACQuire:STATE STOP")
+
+    t0 = time.time()
+    while True:
+        st = safe_query(inst, "ACQuire:STATE?", default="0")
+        if st in ("0", "STOP", "STOPPED"):
+            return
+        if time.time() - t0 > timeout_s:
+            raise TimeoutError("Timed out stopping auto acquisition before waveform read.")
+        time.sleep(poll_s)
+
+
+def acquire_and_wait(inst, const: Dict[str, Union[float, int, bool, str]], poll_s: float = 0.01, timeout_s: float = 30.0):
+    if using_triggered_acquisition():
+        arm_and_wait(inst, poll_s=poll_s, timeout_s=timeout_s)
+    else:
+        run_auto_capture_window(inst, const, poll_s=poll_s, timeout_s=timeout_s)
+
+
+def acquisition_wait_status(i: int) -> str:
+    if using_triggered_acquisition():
+        return f"[{i}/{N_WF}] Waiting for trigger on {TRIG_SOURCE} @ {TRIG_LEVEL_V} V ..."
+    return f"[{i}/{N_WF}] Acquiring auto untriggered roll waveform from {SAVE_SOURCE} ..."
+
+
+def format_duration(seconds: float) -> str:
+    seconds = max(0, int(round(seconds)))
+    hours, rem = divmod(seconds, 3600)
+    minutes, secs = divmod(rem, 60)
+    if hours:
+        return f"{hours}h {minutes:02d}m {secs:02d}s"
+    if minutes:
+        return f"{minutes}m {secs:02d}s"
+    return f"{secs}s"
 
 
 def get_preamble_constants(inst, source: str) -> Dict[str, Union[float, int, str, bool]]:
@@ -413,7 +687,23 @@ def print_capture_readback(inst, const: Dict[str, Union[float, int, str, bool]])
     byt_nr = safe_query(inst, "WFMOutpre:BYT_NR?", default=str(const["BYT_NR"]))
     xinc = safe_query(inst, "WFMOutpre:XINCR?", default=str(const["XINCR"]))
     ymult = safe_query(inst, "WFMOutpre:YMULT?", default=str(const["YMULT"]))
-    print(f"Readback: DATA:RESolution={data_res}, BYT_NR={byt_nr}, XINCR={xinc}, YMULT={ymult}")
+    trig_mode = safe_query(inst, "TRIGger:A:MODe?", default="?")
+    stop_after = safe_query(inst, "ACQuire:STOPAfter?", default="?")
+    horiz_scale = safe_query(inst, "HORizontal:MAIn:SCAle?", default="?")
+    horiz_delay = safe_query(inst, "HORizontal:DELay:TIMe?", default="?")
+    horiz_pos = safe_query(inst, "HORizontal:POSition?", default="?")
+    vert_scale = safe_query(inst, f"{SAVE_SOURCE}:SCAle?", default="?")
+    vert_offset = safe_query(inst, f"{SAVE_SOURCE}:OFFSet?", default="?")
+    vert_pos = safe_query(inst, f"{SAVE_SOURCE}:POSition?", default="?")
+    print(
+        "Readback: "
+        f"ACQUISITION_MODE={normalized_acquisition_mode()}, "
+        f"TRIG_MODE={trig_mode}, STOPAfter={stop_after}, "
+        f"H_SCALE={horiz_scale}, H_DELAY={horiz_delay}, H_POS={horiz_pos}, "
+        f"{SAVE_SOURCE}_SCALE={vert_scale}, {SAVE_SOURCE}_OFFSET={vert_offset}, "
+        f"{SAVE_SOURCE}_POS={vert_pos}, "
+        f"DATA:RESolution={data_res}, BYT_NR={byt_nr}, XINCR={xinc}, YMULT={ymult}"
+    )
 
 
 def read_curve_only(inst, const: Dict[str, Union[float, int, bool, str]]) -> np.ndarray:
@@ -627,17 +917,21 @@ def main():
         if SAVE_CSV and ASYNC_CSV_WRITER:
             csv_queue, csv_writer_state, csv_writer_thread = start_csv_writer()
 
+        run_start_s = time.time()
+        avg_waveform_s: Optional[float] = None
+
         for i in range(1, N_WF + 1):
             attempts = 0
             while True:
                 try:
+                    waveform_start_s = time.time()
                     if SAVE_CSV and csv_writer_state and csv_writer_state["error"] is not None:
                         err = csv_writer_state["error"]
                         raise RuntimeError(f"CSV writer failed: {err}") from err
 
-                    status = f"[{i}/{N_WF}] Waiting for trigger on {TRIG_SOURCE} @ {TRIG_LEVEL_V} V ..."
+                    status = acquisition_wait_status(i)
                     print("\r" + status.ljust(140), end="\r", flush=True)
-                    arm_and_wait(inst, timeout_s=ACQ_TIMEOUT_S, poll_s=POLL_S)
+                    acquire_and_wait(inst, const, timeout_s=ACQ_TIMEOUT_S, poll_s=POLL_S)
 
                     # Optional refresh if you expect settings to change during run
                     if REFRESH_PREAMBLE_EVERY and (i % REFRESH_PREAMBLE_EVERY == 0):
@@ -667,7 +961,23 @@ def main():
                         write_npz_fast(out_npz, t_slice, v_arr)
                         saved_targets.append(str(out_npz))
 
-                    saved_msg = f"[{i}/{N_WF}] Saved: {' | '.join(saved_targets)}"
+                    waveform_s = time.time() - waveform_start_s
+                    if avg_waveform_s is None:
+                        avg_waveform_s = waveform_s
+                    else:
+                        avg_waveform_s = 0.8 * avg_waveform_s + 0.2 * waveform_s
+
+                    remaining_wf = N_WF - i
+                    eta_s = remaining_wf * avg_waveform_s
+                    finish_at = datetime.fromtimestamp(time.time() + eta_s).strftime("%H:%M:%S")
+                    elapsed = format_duration(time.time() - run_start_s)
+                    eta = format_duration(eta_s)
+
+                    saved_msg = (
+                        f"[{i}/{N_WF}] Saved: {' | '.join(saved_targets)} | "
+                        f"last {waveform_s:.2f}s, avg {avg_waveform_s:.2f}s/wf, "
+                        f"elapsed {elapsed}, ETA {eta} (finish {finish_at})"
+                    )
                     print("\r" + saved_msg.ljust(140), end="\r", flush=True)
                     break  # success -> next waveform
 
