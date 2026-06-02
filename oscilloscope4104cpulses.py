@@ -3,6 +3,7 @@ from __future__ import annotations
 import time
 import threading
 import re
+import shutil
 from pathlib import Path
 from queue import Queue
 from typing import Dict, Tuple, List, Union, Optional
@@ -15,13 +16,23 @@ import pyvisa
 # ========================= USER SETTINGS =========================
 USE_DIRECT_RESOURCE = True
 DIRECT_RESOURCE = "TCPIP0::169.254.2.219::INSTR"
+# DIRECT_RESOURCE = "TCPIP0::169.254.2.219::4000::SOCKET"
+
+# True: try DIRECT_RESOURCE first; if *IDN? fails, try common Tek LAN aliases.
+# False: use only DIRECT_RESOURCE and stop immediately if it fails.
+TRY_RESOURCE_FALLBACKS = True
+SOCKET_SERVER_PORT = 4000
 
 MODEL_MATCH = "MDO4104C"
 
-OUTDIR = Path("singleSiPM_pulsedLED_DCDCbias")
+OUTDIR = Path("broadcom_externalsupply_41_5V_darkcounts")
 
-N_WF = 1000
+N_WF = 1500
 RECORD_LENGTH = 100_000
+
+# Filled after setup from the scope readback. This lets waveform transfer show
+# both the requested and scope-applied record lengths.
+APPLIED_RECORD_LENGTH: Optional[int] = None
 
 # TRIGGERED: wait for TRIG_SOURCE/TRIG_LEVEL_V before each saved waveform.
 # AUTO_UNTRIGGERED_ROLL: acquire without requiring an external trigger.
@@ -41,7 +52,7 @@ HORIZONTAL_SCALE_S = "100us"       # seconds/div; accepts strings like "10us", "
 HORIZONTAL_DELAY_S = None       # seconds; accepts strings like "0s", "50us"
 HORIZONTAL_POSITION_PCT = None  # percent, e.g. 50.0
 
-SAVE_VERTICAL_SCALE_V = "15mV"    # volts/div; accepts strings like "5mV", "100mV"
+SAVE_VERTICAL_SCALE_V = "2.5mV"    # volts/div; accepts strings like "5mV", "100mV"
 SAVE_VERTICAL_OFFSET_V = None   # volts; accepts strings like "0V", "25mV"
 SAVE_VERTICAL_POSITION_DIV = None  # divisions, e.g. 0.0
 
@@ -74,11 +85,17 @@ ACQ_TIMEOUT_S = 30.0
 
 # In AUTO_UNTRIGGERED_ROLL mode the scope may keep running instead of stopping
 # by itself. The script waits at least this long, then explicitly stops and reads.
-AUTO_CAPTURE_MIN_S = 0.20
+AUTO_CAPTURE_MIN_S = 0.10
 AUTO_CAPTURE_SETTLE_RECORDS = 1.2
 
 # If the direct VISA resource disappears (VI_ERROR_RSRC_NFOUND), try rediscovering the scope.
 REDISCOVER_ON_RSRC_NFOUND = True
+
+# CLEAR_LINE keeps one live status line and clears it before redrawing. This is
+# compact like the old carriage-return mode, but survives terminal resizing much
+# better because stale characters are erased.
+# LINES prints every status as a permanent line.
+PROGRESS_OUTPUT_MODE = "CLEAR_LINE"  # CLEAR_LINE or LINES
 
 
 
@@ -298,6 +315,37 @@ def qi(inst, cmd: str, default: int) -> int:
         return default
 
 
+def tcpip_host_from_resource(resource: str) -> Optional[str]:
+    """Extract host/IP from a TCPIP VISA resource string."""
+    parts = resource.split("::")
+    if len(parts) >= 2 and parts[0].upper().startswith("TCPIP"):
+        return parts[1]
+    return None
+
+
+def direct_resource_candidates(resource: str) -> List[str]:
+    """Build common Tek LAN resource strings from one direct resource."""
+    candidates = [resource]
+    if not TRY_RESOURCE_FALLBACKS:
+        return candidates
+
+    host = tcpip_host_from_resource(resource)
+    if host:
+        candidates.extend(
+            [
+                f"TCPIP0::{host}::inst0::INSTR",
+                f"TCPIP0::{host}::{SOCKET_SERVER_PORT}::SOCKET",
+            ]
+        )
+
+    # Keep order while removing duplicates.
+    unique: List[str] = []
+    for candidate in candidates:
+        if candidate not in unique:
+            unique.append(candidate)
+    return unique
+
+
 def connect(resource: str, timeout_ms: int = 20000):
     rm = rm_open()
     inst = rm.open_resource(resource)
@@ -311,6 +359,40 @@ def connect(resource: str, timeout_ms: int = 20000):
     except Exception:
         pass
     return inst
+
+
+def connect_any(resources: List[str], timeout_ms: int = 20000):
+    """Try several VISA resource forms and return the first working session."""
+    errors: List[str] = []
+    for resource in resources:
+        try:
+            print(f"Trying VISA resource: {resource}")
+            inst = connect(resource, timeout_ms=timeout_ms)
+            idn = safe_query(inst, "*IDN?", default="").strip()
+            if idn:
+                print(f"Connected using: {resource}")
+                return inst, resource, idn
+            close_quiet(inst)
+            error = f"{resource}: opened, but *IDN? returned empty"
+            print(f"  {error}")
+            errors.append(error)
+        except BaseException as exc:
+            error = f"{resource}: {exc}"
+            print(f"  {error}")
+            errors.append(error)
+
+    detail = "\n".join(errors)
+    if TRY_RESOURCE_FALLBACKS:
+        raise RuntimeError(
+            "Could not connect to the oscilloscope with any VISA resource form.\n"
+            f"Tried:\n{detail}\n\n"
+            "Enable the Tek VXI-11 Server for ::INSTR, or enable Socket Server "
+            f"on port {SOCKET_SERVER_PORT} for ::SOCKET."
+        )
+    raise RuntimeError(
+        "Could not connect to the oscilloscope with DIRECT_RESOURCE.\n"
+        f"Tried:\n{detail}"
+    )
 
 
 def discover_scope(model_substring: str = "MDO4104C", timeout_ms: int = 2500, verbose: bool = True) -> Tuple[str, str]:
@@ -500,6 +582,8 @@ def set_and_verify_trigger_mode(inst, mode: str) -> None:
 
 
 def setup_scope(inst):
+    global APPLIED_RECORD_LENGTH
+
     acq_mode = normalized_acquisition_mode()
     inst.write("ACQuire:STATE STOP")
     try:
@@ -512,6 +596,9 @@ def setup_scope(inst):
     rec_readback = qi(inst, "HORizontal:RECOrdlength?", RECORD_LENGTH)
     if rec_readback != RECORD_LENGTH:
         print(f"Warning: requested RECORD_LENGTH={RECORD_LENGTH}, scope applied {rec_readback}.")
+    else:
+        print(f"Record length applied: {rec_readback}")
+    APPLIED_RECORD_LENGTH = rec_readback
 
     if acq_mode == "TRIGGERED":
         inst.write("TRIGger:A:TYPe EDGe")
@@ -589,6 +676,35 @@ def format_duration(seconds: float) -> str:
     return f"{secs}s"
 
 
+def print_progress(message: str) -> None:
+    """Print acquisition progress using the configured terminal output mode."""
+    mode = PROGRESS_OUTPUT_MODE.strip().upper()
+
+    # Full-line logging is useful for saving the exact acquisition history.
+    if mode == "LINES":
+        print(message, flush=True)
+        return
+
+    # Compact live status line. The ANSI clear-line escape removes leftover
+    # text from longer previous messages, and the current terminal width is used
+    # so resize events do not leave stale characters visible.
+    width = shutil.get_terminal_size((140, 20)).columns
+    visible = message[: max(1, width - 1)]
+    print("\r\033[2K" + visible, end="", flush=True)
+
+
+def compact_progress_mode() -> bool:
+    """Return True when progress output is limited to one live terminal line."""
+    return PROGRESS_OUTPUT_MODE.strip().upper() != "LINES"
+
+
+def progress_target_labels(saved_targets: List[str]) -> List[str]:
+    """Shorten saved target labels in compact mode so timing and ETA stay visible."""
+    if not compact_progress_mode():
+        return saved_targets
+    return [Path(target).name for target in saved_targets]
+
+
 def get_preamble_constants(inst, source: str) -> Dict[str, Union[float, int, str, bool]]:
     """
     Correct units reliably by querying WFMOutpre:<KEY>? individually.
@@ -630,10 +746,15 @@ def get_preamble_constants(inst, source: str) -> Dict[str, Union[float, int, str
     xzero = qf(inst, "WFMOutpre:XZERO?", 0.0)
     ptoff = qf(inst, "WFMOutpre:PT_OFF?", 0.0)
 
-    # WFMOutpre:NR_PT? may report display-decimated points on some firmware.
-    # Use horizontal record length + DATA:STOP readback to force full transfer span.
-    rec_len_scope = qi(inst, "HORizontal:RECOrdlength?", RECORD_LENGTH)
-    target_npt = min(rec_len_scope, RECORD_LENGTH)
+    # Use the scope-accepted record length. If the scope coerces the request
+    # from 20000 to 12500, transfer 12500 instead of chopping to the request.
+    rec_len_scope = qi(inst, "HORizontal:RECOrdlength?", APPLIED_RECORD_LENGTH or RECORD_LENGTH)
+    requested_npt = RECORD_LENGTH
+    target_npt = rec_len_scope if rec_len_scope > 0 else requested_npt
+    print(
+        f"Waveform transfer window request: {requested_npt} points; "
+        f"scope record length readback: {rec_len_scope}; transfer stop: {target_npt}"
+    )
     byt_nr = qi(inst, "WFMOutpre:BYT_NR?", requested_width if requested_width else 2)
     byt_or = safe_query(inst, "WFMOutpre:BYT_OR?", "").upper().strip()  # MSB/LSB sometimes blank
     bn_fmt = safe_query(inst, "WFMOutpre:BN_FMT?", "RI").upper().strip()
@@ -859,14 +980,13 @@ def main():
     if USE_DIRECT_RESOURCE:
         resource = DIRECT_RESOURCE
         try:
-            inst = connect(resource)
+            inst, resource, idn = connect_any(direct_resource_candidates(resource))
         except BaseException as e:
             if _is_rsrc_nfound(e):
                 print(f"\nCould not open VISA resource: {resource}")
                 print("Check scope power/network and run again.")
                 return
             raise
-        idn = safe_query(inst, "*IDN?", default="").strip()
         if not idn:
             close_quiet(inst)
             raise RuntimeError(f"Connected to {resource} but *IDN? returned empty.")
@@ -919,6 +1039,7 @@ def main():
 
         run_start_s = time.time()
         avg_waveform_s: Optional[float] = None
+        last_progress_summary: Optional[str] = None
 
         for i in range(1, N_WF + 1):
             attempts = 0
@@ -929,8 +1050,22 @@ def main():
                         err = csv_writer_state["error"]
                         raise RuntimeError(f"CSV writer failed: {err}") from err
 
-                    status = acquisition_wait_status(i)
-                    print("\r" + status.ljust(140), end="\r", flush=True)
+                    # In compact auto-untriggered mode, keep the last saved
+                    # timing/ETA line visible. The short "Acquiring..." line
+                    # would otherwise overwrite it almost immediately.
+                    show_wait_status = (
+                        using_triggered_acquisition()
+                        or not compact_progress_mode()
+                        or avg_waveform_s is None
+                    )
+                    if show_wait_status:
+                        status = acquisition_wait_status(i)
+                        # In compact triggered mode, the scope may wait here
+                        # for a while. Keep the latest timing/ETA visible while
+                        # still showing that the script is armed for a trigger.
+                        if compact_progress_mode() and using_triggered_acquisition() and last_progress_summary:
+                            status = f"{status} | {last_progress_summary}"
+                        print_progress(status)
                     acquire_and_wait(inst, const, timeout_s=ACQ_TIMEOUT_S, poll_s=POLL_S)
 
                     # Optional refresh if you expect settings to change during run
@@ -972,13 +1107,24 @@ def main():
                     finish_at = datetime.fromtimestamp(time.time() + eta_s).strftime("%H:%M:%S")
                     elapsed = format_duration(time.time() - run_start_s)
                     eta = format_duration(eta_s)
-
-                    saved_msg = (
-                        f"[{i}/{N_WF}] Saved: {' | '.join(saved_targets)} | "
+                    last_progress_summary = (
                         f"last {waveform_s:.2f}s, avg {avg_waveform_s:.2f}s/wf, "
                         f"elapsed {elapsed}, ETA {eta} (finish {finish_at})"
                     )
-                    print("\r" + saved_msg.ljust(140), end="\r", flush=True)
+
+                    # In compact progress mode, keep timing/ETA before filenames
+                    # so terminal-width truncation does not hide run status.
+                    if compact_progress_mode():
+                        saved_msg = (
+                            f"[{i}/{N_WF}] Saved | {last_progress_summary} | "
+                            f"{' | '.join(progress_target_labels(saved_targets))}"
+                        )
+                    else:
+                        saved_msg = (
+                            f"[{i}/{N_WF}] Saved: {' | '.join(saved_targets)} | "
+                            f"{last_progress_summary}"
+                        )
+                    print_progress(saved_msg)
                     break  # success -> next waveform
 
                 except KeyboardInterrupt:

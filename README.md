@@ -4,7 +4,24 @@ Code for adquiring traces from oscilloscope MDO4104C via Ethernet connection. A 
 
 Things for setting up configurations on oscilloscope:
 
-Change to your oscilloscope IP address: `DIRECT_RESOURCE = "TCPIP0::169.254.X.XXX::INSTR"`
+Change to your oscilloscope IP address:
+
+```python
+DIRECT_RESOURCE = "TCPIP0::169.254.X.XXX::INSTR"
+# or, if using the Tek socket server:
+DIRECT_RESOURCE = "TCPIP0::169.254.X.XXX::4000::SOCKET"
+```
+
+The script can try common Tek LAN aliases after the exact `DIRECT_RESOURCE`
+fails:
+
+```python
+TRY_RESOURCE_FALLBACKS = True
+SOCKET_SERVER_PORT = 4000
+```
+
+Set `TRY_RESOURCE_FALLBACKS = False` to use only the exact `DIRECT_RESOURCE`.
+For socket mode, enable the scope socket server on port `4000`.
 
 Model of the device used (needed for detect the osiclloscope via pyvisa): `MODEL_MATCH = "MDO4104C"`
 
