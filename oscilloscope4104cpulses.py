@@ -18,6 +18,7 @@ USE_DIRECT_RESOURCE = True
 DIRECT_RESOURCE = "TCPIP0::169.254.2.219::INSTR"
 # DIRECT_RESOURCE = "TCPIP0::169.254.2.219::4000::SOCKET"
 
+
 # True: try DIRECT_RESOURCE first; if *IDN? fails, try common Tek LAN aliases.
 # False: use only DIRECT_RESOURCE and stop immediately if it fails.
 TRY_RESOURCE_FALLBACKS = True
