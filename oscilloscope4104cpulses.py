@@ -4,20 +4,49 @@ import time
 import threading
 import re
 import shutil
+import math
+import hashlib
+from array import array
 from pathlib import Path
 from queue import Queue
 from typing import Dict, Tuple, List, Union, Optional
 from datetime import datetime
 
+
 import numpy as np
 import pyvisa
+
+# ==================== CSV / SAVE SPEED TUNING ====================
+# Use large OS buffer for CSV writes (bytes). Bigger -> fewer syscalls.
+CSV_BUFFER_BYTES = 1024 * 1024  # 1 MiB
+
+# Enable/disable output formats independently.
+SAVE_CSV = True
+SAVE_NPZ = False
+SAVE_ROOT = False
+
+# ROOT output stores one waveform per TTree entry. This is faster to read later
+# than thousands of CSV files and avoids booking one TH1 per waveform during
+# acquisition. The ROOT writer is loaded lazily, so PyROOT is required only when
+# SAVE_ROOT=True.
+ROOT_OUTPUT_NAME = "waveforms_test.root"
+ROOT_COMPRESSION_LEVEL = 4
+ROOT_STORE_RAW_ADC = False
+
+# Write CSVs in a background thread while acquisition continues.
+# Output CSV content/format is unchanged.
+ASYNC_CSV_WRITER = True
+# Backpressure buffer (number of waveforms waiting for disk write).
+CSV_QUEUE_MAX_ITEMS = 16
+
+# ================================================================
 
 
 # ========================= USER SETTINGS =========================
 USE_DIRECT_RESOURCE = True
 DIRECT_RESOURCE = "TCPIP0::169.254.2.219::INSTR"
+# DIRECT_RESOURCE = "USB0::1689::1110::C010009::0::INSTR"
 # DIRECT_RESOURCE = "TCPIP0::169.254.2.219::4000::SOCKET"
-
 
 # True: try DIRECT_RESOURCE first; if *IDN? fails, try common Tek LAN aliases.
 # False: use only DIRECT_RESOURCE and stop immediately if it fails.
@@ -26,9 +55,21 @@ SOCKET_SERVER_PORT = 4000
 
 MODEL_MATCH = "MDO4104C"
 
-OUTDIR = Path("broadcom_externalsupply_41_5V_darkcounts")
+timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
 
-N_WF = 1500
+OUTDIR = Path(f"/Users/jairorodriguez/work/light_leakage_tests/data/{timestamp}_test")
+
+# OUTDIR = Path(f"/Users/jairorodriguez/work/light_leakage_tests/data/{timestamp}_broadcomflex_40_8Vexternalpsu_DCEMwarm_SoC_Fiber_nomesh_1470nm_1200mW_paper")
+
+# OUTDIR = Path(f"/Users/jairorodriguez/work/light_leakage_tests/data/{timestamp}_broadcomflex_40_8Vexternalpsu_DCEMwarm_SoC_darkcounts_AtEnd_paper")
+
+
+# OUTDIR = Path(f"/Users/jairorodriguez/work/light_leakage_tests/data/{timestamp}_broadcomflex_40_8Vexternalpsu_DCEMwarm_SoC_VDFiber_OPC_1470nm_1200mW_paper")
+
+# OUTDIR = Path(f"/Users/jairorodriguez/work/light_leakage_tests/data/{timestamp}_broadcomflex_40_8Vexternalpsu_DCEMwarm_SoC_ETFEFiber_1mesh_808nm_1000mW_paper")
+
+# N_WF = 30
+N_WF = 3000
 RECORD_LENGTH = 100_000
 
 # Filled after setup from the scope readback. This lets waveform transfer show
@@ -115,8 +156,11 @@ FILE_PREFIX = "tek"
 # If scope doesn't report endianness, fallback to this.
 IS_BIG_ENDIAN = False
 
-# Time formatting like -3.080e-07
+# Minimum time formatting precision. The actual CSV writer can increase this
+# from XINCR so adjacent samples do not print as repeated times.
 TIME_SCI_DECIMALS = 3
+TIME_SCI_GUARD_DIGITS = 2
+TIME_SCI_MAX_DECIMALS = 15
 # Voltage formatting like 0.027 (Tek-like)
 VOLT_FMT = "%.6g"
 
@@ -125,23 +169,20 @@ REFRESH_PREAMBLE_EVERY = 0  # 0 = never
 
 # ================================================================
 
-
-
-# ==================== CSV / SAVE SPEED TUNING ====================
-# Use large OS buffer for CSV writes (bytes). Bigger -> fewer syscalls.
-CSV_BUFFER_BYTES = 1024 * 1024  # 1 MiB
-
-# Enable/disable output formats independently.
-SAVE_CSV = True
-SAVE_NPZ = False
-
-# Write CSVs in a background thread while acquisition continues.
-# Output CSV content/format is unchanged.
-ASYNC_CSV_WRITER = True
-# Backpressure buffer (number of waveforms waiting for disk write).
-CSV_QUEUE_MAX_ITEMS = 16
+# Refuse to save a run when the scope waveform preamble does not match the
+# requested time window. This catches cases where the Tek readback says
+# H_SCALE=100 us/div and RECORD_LENGTH=100000 but WFMOutpre:XINCR is 4 ns
+# instead of the expected 10 ns/sample. Without this guard the CSVs are valid
+# files, but later DCR/rate analysis sees a different acquisition duration.
+ENFORCE_TIMEBASE_MATCH = True
+TIMEBASE_REL_TOL = 0.02
+SCOPE_HORIZONTAL_DIVISIONS = 10.0
 
 # ================================================================
+
+
+
+
 
 SettingValue = Union[str, float, int]
 
@@ -314,6 +355,59 @@ def qi(inst, cmd: str, default: int) -> int:
         return int(float(s))
     except ValueError:
         return default
+
+
+def validate_timebase_matches_configuration(inst, const: Dict[str, Union[float, int, str, bool]]) -> None:
+    """
+    Check that the waveform preamble has the sample interval implied by the
+    configured horizontal scale and record length.
+
+    Tek scopes can sometimes keep/coerce an acquisition sample interval even
+    when HORizontal:MAIn:SCAle? and HORizontal:RECOrdlength? look correct. The
+    CSV writer uses WFMOutpre:XINCR for the time column, so a bad XINCR silently
+    changes the physical duration of every saved waveform. We stop here instead
+    of creating a run that later gives a wrong DCR normalization.
+    """
+    if not ENFORCE_TIMEBASE_MATCH:
+        return
+    if HORIZONTAL_SCALE_S is None:
+        # If the user intentionally leaves the timebase unchanged, there is no
+        # configured scale to compare against. The saved header will still keep
+        # the scope-reported XINCR for downstream analysis.
+        return
+
+    configured_scale_s = selected_horizontal_scale_s()
+    if configured_scale_s is None:
+        return
+
+    npt = int(const["NR_PT"])
+    xincr_s = float(const["XINCR"])
+    if npt <= 0 or xincr_s <= 0:
+        raise RuntimeError(
+            f"Invalid waveform preamble: NR_PT={npt}, XINCR={xincr_s:g}. "
+            "Refusing to save CSVs with invalid timing metadata."
+        )
+
+    expected_xincr_s = SCOPE_HORIZONTAL_DIVISIONS * configured_scale_s / float(npt)
+    rel_diff = abs(xincr_s - expected_xincr_s) / expected_xincr_s
+    if rel_diff <= TIMEBASE_REL_TOL:
+        return
+
+    horiz_scale_rb = safe_query(inst, "HORizontal:MAIn:SCAle?", default="?")
+    rec_len_rb = safe_query(inst, "HORizontal:RECOrdlength?", default="?")
+    raise RuntimeError(
+        "Scope timing preamble does not match the configured acquisition window.\n"
+        f"  Configured HORIZONTAL_SCALE_S: {configured_scale_s:g} s/div\n"
+        f"  Scope H_SCALE readback: {horiz_scale_rb}\n"
+        f"  Configured/transfer points: {npt}\n"
+        f"  Scope record length readback: {rec_len_rb}\n"
+        f"  Expected XINCR: {expected_xincr_s:.12g} s/sample\n"
+        f"  Scope WFMOutpre:XINCR: {xincr_s:.12g} s/sample\n"
+        f"  Relative difference: {100.0 * rel_diff:.3g}% "
+        f"(allowed {100.0 * TIMEBASE_REL_TOL:.3g}%).\n"
+        "Stop/reapply the scope timebase or power-cycle/reconnect the scope, "
+        "then rerun. This prevents saving a run with the wrong physical duration."
+    )
 
 
 def tcpip_host_from_resource(resource: str) -> Optional[str]:
@@ -875,6 +969,34 @@ def build_time_array(const: Dict[str, Union[float, int, bool, str]]) -> np.ndarr
     return t
 
 
+def build_time_savetxt_format(const: Dict[str, Union[float, int, bool, str]]) -> str:
+    """
+    Choose enough scientific-notation decimals for the TIME column to resolve
+    one sample step.
+
+    With the old fixed %.3e format, a 4 ns sample interval near -40 us printed
+    repeated values such as -4.000e-05 for several adjacent samples. The raw
+    timing was correct in memory, but the text representation hid the step. This
+    helper estimates the largest displayed time exponent and asks for enough
+    mantissa digits that one XINCR step changes visible digits, plus guard
+    digits to avoid round-to-same edge cases.
+    """
+    xincr = abs(float(const["XINCR"]))
+    xzero = float(const["XZERO"])
+    ptoff = float(const["PT_OFF"])
+    npt = int(const["NR_PT"])
+    if xincr <= 0.0 or npt <= 1:
+        return f"%.{TIME_SCI_DECIMALS}e"
+
+    first_t = (0.0 - ptoff) * xincr + xzero
+    last_t = (float(npt - 1) - ptoff) * xincr + xzero
+    max_abs_t = max(abs(first_t), abs(last_t), xincr)
+    display_exponent = math.floor(math.log10(max_abs_t)) if max_abs_t > 0.0 else 0
+    required_decimals = math.ceil(display_exponent - math.log10(xincr)) + TIME_SCI_GUARD_DIGITS
+    decimals = max(TIME_SCI_DECIMALS, min(TIME_SCI_MAX_DECIMALS, required_decimals))
+    return f"%.{decimals}e"
+
+
 def build_header_lines(inst, idn: str, const: Dict[str, Union[float, int, bool, str]], save_source: str) -> List[str]:
     """
     Exact header layout like your pasted Tek files.
@@ -931,24 +1053,25 @@ def write_npz_fast(path: Path, t: np.ndarray, v: np.ndarray):
     np.savez_compressed(path, t=t, v=v)
 
 
-def write_csv_fast(path: Path, header_lines: List[str], t: np.ndarray, v: np.ndarray):
+def write_csv_fast(path: Path, header_lines: List[str], t: np.ndarray, v: np.ndarray, time_fmt: str):
     """
     Fast, correct writing:
     - Header is written exactly as lines (same as your pasted files)
     - Data is written by numpy.savetxt (much faster than per-row writerow)
+    - time_fmt is computed once from XINCR so the printed TIME column resolves
+      the smallest sample step in this run.
     """
     path.parent.mkdir(parents=True, exist_ok=True)
     with path.open("w", newline="", buffering=CSV_BUFFER_BYTES) as f:
         f.writelines(header_lines)
         data = np.column_stack((t, v))
-        t_fmt = f"%.{TIME_SCI_DECIMALS}e"
-        np.savetxt(f, data, delimiter=",", fmt=[t_fmt, VOLT_FMT])
+        np.savetxt(f, data, delimiter=",", fmt=[time_fmt, VOLT_FMT])
 
 
 def start_csv_writer():
     """
     Start background CSV writer.
-    Queue item format: (path, header_lines, t_array, v_array).
+    Queue item format: (path, header_lines, t_array, v_array, time_format).
     """
     q: Queue = Queue(maxsize=CSV_QUEUE_MAX_ITEMS)
     state: Dict[str, Optional[BaseException]] = {"error": None}
@@ -959,9 +1082,9 @@ def start_csv_writer():
             try:
                 if item is None:
                     return
-                out, header_lines, t_local, v_local = item
+                out, header_lines, t_local, v_local, time_fmt = item
                 if state["error"] is None:
-                    write_csv_fast(out, header_lines, t_local, v_local)
+                    write_csv_fast(out, header_lines, t_local, v_local, time_fmt)
             except BaseException as e:
                 if state["error"] is None:
                     state["error"] = e
@@ -973,9 +1096,240 @@ def start_csv_writer():
     return q, state, th
 
 
+class RootWaveformWriter:
+    """
+    Native ROOT writer for MDO waveform acquisition.
+
+    The file layout is intentionally simple:
+
+      metadata      one-entry TTree with run-level scope/readback/config values
+      waveforms     one entry per acquired waveform
+
+    Each waveform entry contains a fileName string that mirrors the CSV stem,
+    the waveform index, timing metadata, and a variable-length ROOT leaf
+    voltageV[nSamples]/F. A fixed NumPy backing buffer is reused for every
+    Fill(), which is much faster than pushing 100k samples into a std::vector
+    from Python one element at a time.
+    """
+
+    _SHORT_TEXT_CAPACITY = 256
+    _PATH_TEXT_CAPACITY = 1024
+    _HEADER_TEXT_CAPACITY = 65536
+
+    @staticmethod
+    def _make_char_buffer(capacity: int) -> array:
+        """Create a null-filled C-style char buffer for a ROOT `/C` branch."""
+        return array("b", [0]) * capacity
+
+    @staticmethod
+    def _set_char_buffer(buffer: array, value: str) -> None:
+        """
+        Copy Python text into a mutable char[] buffer used as a TTree branch.
+
+        Some recent PyROOT builds pythonize ROOT.std.string() into a plain
+        Python str, which is not a stable mutable branch buffer across Fill().
+        Some builds also expose only the one-argument `ROOT.AddressOf(obj)`, so
+        struct-field addresses are not portable either. A Python `array('b')`
+        is a direct mutable C buffer that ROOT can branch as a null-terminated
+        `/C` string. Values are truncated with room for the null terminator.
+        """
+        capacity = len(buffer)
+        text = str(value)
+        encoded = text.encode("ascii", errors="replace")[: max(0, capacity - 1)]
+
+        # Clear the full buffer first so shorter later strings do not leave
+        # characters from a previous waveform name after the null terminator.
+        buffer[:] = array("b", [0]) * capacity
+        if encoded:
+            buffer[: len(encoded)] = array("b", encoded)
+
+    @staticmethod
+    def _waveform_hash64(voltage_v: np.ndarray) -> int:
+        """
+        Return a stable 64-bit content hash for one saved waveform.
+
+        The hash is computed from the same float32 voltage representation that
+        is written to the ROOT `voltageV` branch. That makes it useful for later
+        duplicate searches on the saved ROOT content, independent of CSV text
+        formatting or NumPy default float64 details. The sample count is mixed
+        into the digest first so different-length buffers cannot collide merely
+        by sharing a byte prefix.
+        """
+        voltage32 = np.ascontiguousarray(voltage_v, dtype=np.float32)
+        digest = hashlib.blake2b(digest_size=8)
+        digest.update(np.uint64(voltage32.size).tobytes())
+        digest.update(voltage32.view(np.uint8))
+        return int.from_bytes(digest.digest(), byteorder="little", signed=False)
+
+    def __init__(
+        self,
+        path: Path,
+        *,
+        idn: str,
+        resource: str,
+        const: Dict[str, Union[float, int, bool, str]],
+        header_lines: List[str],
+        outdir: Path,
+        save_source: str,
+    ):
+        try:
+            import ROOT  # type: ignore
+        except ImportError as exc:
+            raise RuntimeError(
+                "SAVE_ROOT=True requires PyROOT, but import ROOT failed. "
+                "Use SAVE_ROOT=False or run inside a ROOT/PyROOT environment."
+            ) from exc
+
+        self.ROOT = ROOT
+        self.path = path
+        path.parent.mkdir(parents=True, exist_ok=True)
+
+        # Open in RECREATE mode because acquisition output is a new raw-data
+        # file for this run. Compression level 4 is a good compromise between
+        # speed and file size for large voltage vectors.
+        self.file = ROOT.TFile(str(path), "RECREATE")
+        if self.file.IsZombie():
+            raise RuntimeError(f"Could not create ROOT output file: {path}")
+        self.file.SetCompressionLevel(int(ROOT_COMPRESSION_LEVEL))
+
+        self.metadata_tree = ROOT.TTree("metadata", "MDO4104C acquisition run metadata")
+        self.waveforms_tree = ROOT.TTree("waveforms", "MDO4104C waveform vectors")
+
+        # String branch buffers must stay alive as attributes until the TTree is
+        # written. Python arrays are stable mutable C buffers for ROOT `/C`
+        # branches and avoid version-dependent PyROOT std::string/AddressOf
+        # behavior.
+        self.run_id = self._make_char_buffer(self._SHORT_TEXT_CAPACITY)
+        self.idn = self._make_char_buffer(self._PATH_TEXT_CAPACITY)
+        self.resource = self._make_char_buffer(self._PATH_TEXT_CAPACITY)
+        self.outdir = self._make_char_buffer(self._PATH_TEXT_CAPACITY)
+        self.save_source = self._make_char_buffer(self._SHORT_TEXT_CAPACITY)
+        self.acquisition_mode = self._make_char_buffer(self._SHORT_TEXT_CAPACITY)
+        self.bandwidth_option = self._make_char_buffer(self._SHORT_TEXT_CAPACITY)
+        self.data_resolution = self._make_char_buffer(self._SHORT_TEXT_CAPACITY)
+        self.header_text = self._make_char_buffer(self._HEADER_TEXT_CAPACITY)
+
+        self._set_char_buffer(self.run_id, datetime.now().strftime("%Y%m%d_%H%M%S"))
+        self._set_char_buffer(self.idn, idn)
+        self._set_char_buffer(self.resource, resource)
+        self._set_char_buffer(self.outdir, str(outdir))
+        self._set_char_buffer(self.save_source, save_source)
+        self._set_char_buffer(self.acquisition_mode, str(ACQUISITION_MODE))
+        self._set_char_buffer(self.bandwidth_option, str(BANDWIDTH_OPTION))
+        self._set_char_buffer(self.data_resolution, str(DATA_RESOLUTION))
+        self._set_char_buffer(self.header_text, "".join(header_lines))
+
+        self.n_requested = array("i", [int(N_WF)])
+        self.record_length_requested = array("i", [int(RECORD_LENGTH)])
+        self.record_length_applied = array("i", [int(APPLIED_RECORD_LENGTH or 0)])
+        self.n_samples_preamble = array("i", [int(const["NR_PT"])])
+        self.data_width_bytes = array("i", [int(const["BYT_NR"])])
+        self.sample_interval_s = array("d", [float(const["XINCR"])])
+        self.x_zero_s = array("d", [float(const["XZERO"])])
+        self.point_offset = array("d", [float(const["PT_OFF"])])
+        self.y_mult_v = array("d", [float(const["YMULT"])])
+        self.y_offset_adc = array("d", [float(const["YOFF"])])
+        self.y_zero_v = array("d", [float(const["YZERO"])])
+        self.horizontal_scale_s = array("d", [selected_horizontal_scale_s() or math.nan])
+
+        self.metadata_tree.Branch("runId", self.run_id, "runId/C")
+        self.metadata_tree.Branch("idn", self.idn, "idn/C")
+        self.metadata_tree.Branch("resource", self.resource, "resource/C")
+        self.metadata_tree.Branch("outdir", self.outdir, "outdir/C")
+        self.metadata_tree.Branch("saveSource", self.save_source, "saveSource/C")
+        self.metadata_tree.Branch("acquisitionMode", self.acquisition_mode, "acquisitionMode/C")
+        self.metadata_tree.Branch("bandwidthOption", self.bandwidth_option, "bandwidthOption/C")
+        self.metadata_tree.Branch("dataResolution", self.data_resolution, "dataResolution/C")
+        self.metadata_tree.Branch("headerText", self.header_text, "headerText/C")
+        self.metadata_tree.Branch("nWaveformsRequested", self.n_requested, "nWaveformsRequested/I")
+        self.metadata_tree.Branch("recordLengthRequested", self.record_length_requested, "recordLengthRequested/I")
+        self.metadata_tree.Branch("recordLengthApplied", self.record_length_applied, "recordLengthApplied/I")
+        self.metadata_tree.Branch("nSamplesPreamble", self.n_samples_preamble, "nSamplesPreamble/I")
+        self.metadata_tree.Branch("dataWidthBytes", self.data_width_bytes, "dataWidthBytes/I")
+        self.metadata_tree.Branch("sampleIntervalS", self.sample_interval_s, "sampleIntervalS/D")
+        self.metadata_tree.Branch("xZeroS", self.x_zero_s, "xZeroS/D")
+        self.metadata_tree.Branch("pointOffset", self.point_offset, "pointOffset/D")
+        self.metadata_tree.Branch("yMultV", self.y_mult_v, "yMultV/D")
+        self.metadata_tree.Branch("yOffsetADC", self.y_offset_adc, "yOffsetADC/D")
+        self.metadata_tree.Branch("yZeroV", self.y_zero_v, "yZeroV/D")
+        self.metadata_tree.Branch("horizontalScaleS", self.horizontal_scale_s, "horizontalScaleS/D")
+        self.metadata_tree.Fill()
+
+        self.max_samples_per_waveform = int(const["NR_PT"])
+        self.waveform_index = array("i", [0])
+        self.n_samples = array("i", [0])
+        self.acquisition_unix_s = array("d", [0.0])
+        self.waveform_sample_interval_s = array("d", [float(const["XINCR"])])
+        self.waveform_x_zero_s = array("d", [float(const["XZERO"])])
+        self.waveform_point_offset = array("d", [float(const["PT_OFF"])])
+        self.file_name = self._make_char_buffer(self._PATH_TEXT_CAPACITY)
+        self.waveform_hash = array("Q", [0])
+        self.waveform_hash_hex = self._make_char_buffer(self._SHORT_TEXT_CAPACITY)
+        self.voltage_v = np.zeros(self.max_samples_per_waveform, dtype=np.float32)
+        self.raw_adc = np.zeros(self.max_samples_per_waveform, dtype=np.int32)
+
+        self.waveforms_tree.Branch("waveformIndex", self.waveform_index, "waveformIndex/I")
+        self.waveforms_tree.Branch("fileName", self.file_name, "fileName/C")
+        self.waveforms_tree.Branch("waveformHash", self.waveform_hash, "waveformHash/l")
+        self.waveforms_tree.Branch("waveformHashHex", self.waveform_hash_hex, "waveformHashHex/C")
+        self.waveforms_tree.Branch("nSamples", self.n_samples, "nSamples/I")
+        self.waveforms_tree.Branch("acquisitionUnixS", self.acquisition_unix_s, "acquisitionUnixS/D")
+        self.waveforms_tree.Branch("sampleIntervalS", self.waveform_sample_interval_s, "sampleIntervalS/D")
+        self.waveforms_tree.Branch("xZeroS", self.waveform_x_zero_s, "xZeroS/D")
+        self.waveforms_tree.Branch("pointOffset", self.waveform_point_offset, "pointOffset/D")
+        self.waveforms_tree.Branch("voltageV", self.voltage_v, "voltageV[nSamples]/F")
+        if ROOT_STORE_RAW_ADC:
+            self.waveforms_tree.Branch("rawADC", self.raw_adc, "rawADC[nSamples]/I")
+
+    def write_waveform(
+        self,
+        *,
+        waveform_index: int,
+        file_name: str,
+        acquisition_unix_s: float,
+        voltage_v: np.ndarray,
+        raw_adc: np.ndarray,
+        const: Dict[str, Union[float, int, bool, str]],
+    ) -> None:
+        """Fill one TTree entry for one acquired waveform."""
+        if len(voltage_v) > self.max_samples_per_waveform:
+            raise RuntimeError(
+                f"ROOT waveform buffer was created for {self.max_samples_per_waveform} samples, "
+                f"but waveform {waveform_index} has {len(voltage_v)} samples. "
+                "Use a stable record length during ROOT acquisition."
+            )
+        self.waveform_index[0] = int(waveform_index)
+        self.n_samples[0] = int(len(voltage_v))
+        self.acquisition_unix_s[0] = float(acquisition_unix_s)
+        self.waveform_sample_interval_s[0] = float(const["XINCR"])
+        self.waveform_x_zero_s[0] = float(const["XZERO"])
+        self.waveform_point_offset[0] = float(const["PT_OFF"])
+
+        self._set_char_buffer(self.file_name, file_name)
+        self.waveform_hash[0] = self._waveform_hash64(voltage_v)
+        self._set_char_buffer(self.waveform_hash_hex, f"{self.waveform_hash[0]:016x}")
+
+        self.voltage_v[: self.n_samples[0]] = np.asarray(voltage_v, dtype=np.float32)
+
+        if ROOT_STORE_RAW_ADC:
+            self.raw_adc[: self.n_samples[0]] = np.asarray(raw_adc, dtype=np.int32)
+
+        self.waveforms_tree.Fill()
+
+    def close(self) -> None:
+        """Write TTrees and close the ROOT file."""
+        if not getattr(self, "file", None):
+            return
+        self.file.cd()
+        self.metadata_tree.Write("", self.ROOT.TObject.kOverwrite)
+        self.waveforms_tree.Write("", self.ROOT.TObject.kOverwrite)
+        self.file.Close()
+        self.file = None
+
+
 def main():
-    if not SAVE_CSV and not SAVE_NPZ:
-        raise ValueError("At least one output format must be enabled: SAVE_CSV or SAVE_NPZ.")
+    if not SAVE_CSV and not SAVE_NPZ and not SAVE_ROOT:
+        raise ValueError("At least one output format must be enabled: SAVE_CSV, SAVE_NPZ, or SAVE_ROOT.")
 
     inst = None
     if USE_DIRECT_RESOURCE:
@@ -1005,6 +1359,7 @@ def main():
     csv_queue = None
     csv_writer_state = None
     csv_writer_thread = None
+    root_writer: Optional[RootWaveformWriter] = None
     stop_requested = False
 
     try:
@@ -1032,11 +1387,26 @@ def main():
         const = get_preamble_constants(inst, SAVE_SOURCE)
         print(f"Record length for transfer: {int(const['NR_PT'])}")
         print_capture_readback(inst, const)
+        validate_timebase_matches_configuration(inst, const)
         t_arr = build_time_array(const)
+        time_fmt = build_time_savetxt_format(const)
         header_lines = build_header_lines(inst, idn, const, SAVE_SOURCE)
 
         if SAVE_CSV and ASYNC_CSV_WRITER:
             csv_queue, csv_writer_state, csv_writer_thread = start_csv_writer()
+
+        if SAVE_ROOT:
+            root_path = OUTDIR / ROOT_OUTPUT_NAME
+            root_writer = RootWaveformWriter(
+                root_path,
+                idn=idn,
+                resource=resource,
+                const=const,
+                header_lines=header_lines,
+                outdir=OUTDIR,
+                save_source=SAVE_SOURCE,
+            )
+            print(f"ROOT output: {root_path}")
 
         run_start_s = time.time()
         avg_waveform_s: Optional[float] = None
@@ -1072,30 +1442,48 @@ def main():
                     # Optional refresh if you expect settings to change during run
                     if REFRESH_PREAMBLE_EVERY and (i % REFRESH_PREAMBLE_EVERY == 0):
                         const = get_preamble_constants(inst, SAVE_SOURCE)
+                        validate_timebase_matches_configuration(inst, const)
                         t_arr = build_time_array(const)
+                        time_fmt = build_time_savetxt_format(const)
                         header_lines = build_header_lines(inst, idn, const, SAVE_SOURCE)
 
                     y_raw = read_curve_only(inst, const)
-                    v_arr, _ = scale_waveform(y_raw, const)
+                    v_arr, raw_arr = scale_waveform(y_raw, const)
 
                     # ts = time.strftime("%Y%m%d_%H%M%S")
                     ts = datetime.now().strftime("%Y%m%d_%H%M%S_%f")[:-3]  # milliseconds
                     out_base = OUTDIR / f"{FILE_PREFIX}_{SAVE_SOURCE}_BW{BANDWIDTH_OPTION}_{ts}_{i:04d}"
+                    acquisition_unix_s = time.time()
                     t_slice = t_arr[: len(v_arr)]
                     saved_targets: List[str] = []
 
                     if SAVE_CSV:
                         out_csv = out_base.with_suffix(".csv")
                         if ASYNC_CSV_WRITER and csv_queue is not None:
-                            csv_queue.put((out_csv, header_lines, t_slice.copy(), v_arr.copy()))
+                            csv_queue.put((out_csv, header_lines, t_slice.copy(), v_arr.copy(), time_fmt))
                         else:
-                            write_csv_fast(out_csv, header_lines, t_slice, v_arr)
+                            write_csv_fast(out_csv, header_lines, t_slice, v_arr, time_fmt)
                         saved_targets.append(str(out_csv))
 
                     if SAVE_NPZ:
                         out_npz = out_base.with_suffix(".npz")
                         write_npz_fast(out_npz, t_slice, v_arr)
                         saved_targets.append(str(out_npz))
+
+                    if SAVE_ROOT and root_writer is not None:
+                        # Store one waveform vector per ROOT TTree entry. The
+                        # fileName branch uses the CSV-like stem, so downstream
+                        # code can treat each entry as the ROOT equivalent of
+                        # one acquired Tek CSV.
+                        root_writer.write_waveform(
+                            waveform_index=i,
+                            file_name=out_base.name,
+                            acquisition_unix_s=acquisition_unix_s,
+                            voltage_v=v_arr,
+                            raw_adc=raw_arr,
+                            const=const,
+                        )
+                        saved_targets.append(str(OUTDIR / ROOT_OUTPUT_NAME))
 
                     waveform_s = time.time() - waveform_start_s
                     if avg_waveform_s is None:
@@ -1106,11 +1494,9 @@ def main():
                     remaining_wf = N_WF - i
                     eta_s = remaining_wf * avg_waveform_s
                     finish_at = datetime.fromtimestamp(time.time() + eta_s).strftime("%H:%M:%S")
-                    elapsed = format_duration(time.time() - run_start_s)
                     eta = format_duration(eta_s)
                     last_progress_summary = (
-                        f"last {waveform_s:.2f}s, avg {avg_waveform_s:.2f}s/wf, "
-                        f"elapsed {elapsed}, ETA {eta} (finish {finish_at})"
+                        f"avg {avg_waveform_s:.2f}s/wf, ETA {eta} (finish {finish_at})"
                     )
 
                     # In compact progress mode, keep timing/ETA before filenames
@@ -1195,7 +1581,9 @@ def main():
 
                     setup_scope(inst)
                     const = get_preamble_constants(inst, SAVE_SOURCE)
+                    validate_timebase_matches_configuration(inst, const)
                     t_arr = build_time_array(const)
+                    time_fmt = build_time_savetxt_format(const)
                     header_lines = build_header_lines(inst, idn, const, SAVE_SOURCE)
                     continue
 
@@ -1235,6 +1623,11 @@ def main():
                 inst.clear()
             except Exception:
                 pass
+        if root_writer is not None:
+            try:
+                root_writer.close()
+            except Exception as e:
+                print(f"Warning: failed to close ROOT output cleanly: {e}")
         close_quiet(inst)
 
 
